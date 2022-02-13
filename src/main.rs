@@ -1,5 +1,5 @@
 use core::fmt;
-use std::{collections::HashMap, num::ParseFloatError, io};
+use std::{collections::HashMap, num::ParseFloatError, io, rc::Rc};
 
 #[derive(Clone)]
 enum RispExp {
@@ -8,6 +8,7 @@ enum RispExp {
     Number(f64),
     List(Vec<RispExp>),
     Func(fn(&[RispExp]) -> Result<RispExp, RispErr>),
+    Lambda(RispLambda),
 }
 
 #[derive(Debug)]
@@ -16,8 +17,15 @@ enum RispErr {
 }
 
 #[derive(Clone)]
-struct RispEnv {
+struct RispEnv<'a> {
     data: HashMap<String, RispExp>,
+    outer: Option<&'a RispEnv<'a>>,
+}
+
+#[derive(Clone)]
+struct RispLambda {
+    params_exp: Rc<RispExp>,
+    body_exp: Rc<RispExp>,
 }
 
 macro_rules! ensure_tonicity {
@@ -39,7 +47,7 @@ macro_rules! ensure_tonicity {
 
 // でふぉ環境つくる
 
-fn default_env() -> RispEnv {
+fn default_env<'a>() -> RispEnv<'a> {
     let mut data: HashMap<String, RispExp> = HashMap::new();
 
     data.insert(
@@ -84,10 +92,8 @@ fn default_env() -> RispEnv {
         RispExp::Func(ensure_tonicity!(|a, b| a <= b)),
     );
 
-    RispEnv{data}
+    RispEnv{data, outer:None}
 }
-
-
 
 fn parse_list_of_floats(args: &[RispExp]) -> Result<Vec<f64>, RispErr> {
     args.iter()
@@ -155,12 +161,23 @@ fn parse_atom(token: &str) -> RispExp {
     }
 }
 
+fn env_get(k: &str, env: &RispEnv) -> Option<RispExp> {
+    match env.data.get(k) {
+        Some(exp) => Some(exp.clone()),
+        None => {
+            match &env.outer {
+                Some(outer_env) => env_get(k, &outer_env),
+                None => None,
+            }
+        },
+    }
+}
 // eval
 fn eval(exp: &RispExp, env: &mut RispEnv) -> Result<RispExp, RispErr> {
     match exp {
         RispExp::Bool(_a) => Ok(exp.clone()),
         RispExp::Symbol(k) => 
-            env.data.get(k)
+            env_get(k, env)
             .ok_or(
                 RispErr::Reason(
                     format!("unexpected symbol {}", k)
@@ -180,11 +197,11 @@ fn eval(exp: &RispExp, env: &mut RispEnv) -> Result<RispExp, RispErr> {
                     let first_eval = eval(first_form, env)?;
                     match first_eval {
                         RispExp::Func(f) => {
-                            let args_eval = arg_forms
-                                .iter()
-                                .map(|x| eval(x, env))
-                                .collect::<Result<Vec<RispExp>, RispErr>>();
-                            f(&args_eval?)
+                            f(&eval_forms(arg_forms, env)?)
+                        },
+                        RispExp::Lambda(lambda) => {
+                            let new_env = &mut env_for_lambda(lambda.params_exp, arg_forms, env)?;
+                            eval(&lambda.body_exp, new_env)
                         },
                         _ => Err(
                             RispErr::Reason("first form must be a function".to_string())
@@ -194,6 +211,9 @@ fn eval(exp: &RispExp, env: &mut RispEnv) -> Result<RispExp, RispErr> {
             }
         },
         RispExp::Func(_) => Err (
+            RispErr::Reason("unexpected form".to_string())
+        ),
+        RispExp::Lambda(_) => Err (
             RispErr::Reason("unexpected form".to_string())
         ),
     }
@@ -208,6 +228,7 @@ fn eval_built_in_form(
             match s.as_ref() {
                 "if" => Some(eval_if_args(arg_forms, env)),
                 "def" => Some(eval_def_args(arg_forms, env)),
+                "fn" => Some(eval_lambda_args(arg_forms)),
                 _ => None,
             }
         },
@@ -270,6 +291,87 @@ fn eval_def_args(arg_forms: &[RispExp], env: &mut RispEnv) -> Result<RispExp, Ri
     Ok(first_form.clone())
 }
 
+fn eval_forms(arg_forms: &[RispExp], env: &mut RispEnv) -> Result<Vec<RispExp>, RispErr> {
+    arg_forms.iter()
+        .map(|x| eval(x, env))
+        .collect()
+}
+
+
+fn eval_lambda_args(arg_forms: &[RispExp]) -> Result<RispExp, RispErr> {
+    let params_exp = arg_forms.first().ok_or(
+        RispErr::Reason("expected args form".to_string()),
+    )?;
+    let body_exp = arg_forms.get(1).ok_or(
+        RispErr::Reason("expected second form".to_string()),
+    )?;
+    if arg_forms.len() > 2 {
+        return Err(
+            RispErr::Reason(
+                "fn has to be defined with two values".to_string()
+            ),
+        )
+    }
+
+    Ok(
+        RispExp::Lambda(
+            RispLambda{
+                body_exp: Rc::new(body_exp.clone()),
+                params_exp: Rc::new(params_exp.clone()),
+            }
+        )
+    )
+}
+
+fn env_for_lambda<'a>(
+    params: Rc<RispExp>,
+    arg_forms: &[RispExp],
+    outer_env: &'a mut RispEnv,
+) -> Result<RispEnv<'a>, RispErr> 
+{
+    // ks = 何の略？数の分lambdaの引数を受け取る
+    let ks = parse_list_of_symbol_strings(params)?;
+    if ks.len() != arg_forms.len() {
+        return Err(
+            RispErr::Reason(
+                format!("expected {} arguments, got {}", ks.len(), arg_forms.len())
+            )
+        )
+    }
+    let vs = eval_forms(arg_forms, outer_env)?;
+    let mut data: HashMap<String, RispExp> = HashMap::new();
+    for (k, v) in ks.iter().zip(vs.iter()) {
+        data.insert(k.clone(), v.clone());
+    }
+    Ok(
+        RispEnv {
+            data,
+            outer: Some(outer_env),
+        }
+    )
+}
+
+fn parse_list_of_symbol_strings(form: Rc<RispExp>) -> Result<Vec<String>, RispErr> {
+    let list = match form.as_ref() {
+        RispExp::List(s) => Ok(s.clone()),
+        _ => Err(RispErr::Reason(
+                "expected args form to be a list".to_string())
+        ),
+    }?;
+    list.iter()
+        .map(
+            |x| {
+                match x {
+                    RispExp::Symbol(s) => Ok(s.clone()),
+                    _ => Err(RispErr::Reason(
+                            "expected symbols in the argument".to_string())
+                    ),
+                }
+            }
+        )
+        .collect()
+}
+
 impl fmt::Display for RispExp {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let str = match self {
@@ -284,6 +386,7 @@ impl fmt::Display for RispExp {
                 format!("({})", xs.join(","))
             },
             RispExp::Func(_) => "Function {}".to_string(),
+            RispExp::Lambda(_) => "Lambda {}".to_string(),
         };
 
         write!(f, "{}", str)
